@@ -1302,8 +1302,12 @@ def construct_arguments(
 
     env = _get_rustc_env(attr, toolchain, crate_info.name)
 
-    # Wrapper args first
+    # Wrapper args first. They grow with every transitive build script (an
+    # --env-file, --arg-file and --subst each), so let Bazel spill them to a
+    # param file once the command line is too long for the OS.
     process_wrapper_flags = ctx.actions.args()
+    process_wrapper_flags.set_param_file_format("multiline")
+    process_wrapper_flags.use_param_file("--flagfile=%s", use_always = False)
 
     for build_env_file in build_env_files:
         process_wrapper_flags.add("--env-file", build_env_file)

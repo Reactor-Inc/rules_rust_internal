@@ -160,10 +160,11 @@ pub(crate) fn options() -> Result<Options, OptionError> {
         &mut require_explicit_unstable_features,
     );
 
-    let mut child_args = match flags
-        .parse(env::args().collect())
-        .map_err(OptionError::FlagError)?
-    {
+    let argv = expand_flag_files(env::args().collect(), |path| {
+        std::fs::read_to_string(path)
+            .map_err(|e| OptionError::Generic(format!("failed to read flag file {path:?}: {e}")))
+    })?;
+    let mut child_args = match flags.parse(argv).map_err(OptionError::FlagError)? {
         ParseOutcome::Help(help) => {
             eprintln!("{help}");
             exit(0);
@@ -406,6 +407,34 @@ fn is_allow_features_flag(arg: &str) -> bool {
     arg.starts_with("-Zallow-features=") || arg.starts_with("allow-features=")
 }
 
+/// Prefix of the argument naming a file of process_wrapper flags. Bazel writes the wrapper's own
+/// flags to this file instead of the command line when the command line would be too long, as
+/// with the 32767-character `CreateProcessW` limit on Windows.
+const FLAG_FILE_PREFIX: &str = "--flagfile=";
+
+/// Replaces each `--flagfile=<path>` before the `--` separator with the lines of `<path>`, one
+/// argument per line as Bazel's `multiline` param file format writes them. Arguments from `--`
+/// on belong to the child process and pass through unchanged.
+fn expand_flag_files(
+    argv: Vec<String>,
+    mut read_file: impl FnMut(&str) -> Result<String, OptionError>,
+) -> Result<Vec<String>, OptionError> {
+    let mut expanded = Vec::with_capacity(argv.len());
+    let mut argv = argv.into_iter();
+    for arg in argv.by_ref() {
+        if arg == "--" {
+            expanded.push(arg);
+            break;
+        }
+        match arg.strip_prefix(FLAG_FILE_PREFIX) {
+            Some(path) => expanded.extend(read_file(path)?.lines().map(str::to_owned)),
+            None => expanded.push(arg),
+        }
+    }
+    expanded.extend(argv);
+    Ok(expanded)
+}
+
 fn prepare_arg(mut arg: String, subst_mappings: &[(String, String)]) -> String {
     for (f, replace_with) in subst_mappings {
         let from = format!("${{{f}}}");
@@ -543,6 +572,52 @@ fn environment_block(
 #[cfg(test)]
 mod test {
     use super::*;
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn flag_files_expand_before_separator_only() {
+        let argv = strings(&[
+            "process_wrapper",
+            "--touch-file",
+            "done",
+            "--flagfile=wrapper.params",
+            "--",
+            "rustc",
+            "--flagfile=child.params",
+        ]);
+        let expanded = expand_flag_files(argv, |path| {
+            assert_eq!(path, "wrapper.params");
+            Ok("--arg-file\na b\r\n--cargo-bin-name\n\n--subst\npwd=${pwd}\n".to_owned())
+        })
+        .unwrap();
+        assert_eq!(
+            expanded,
+            strings(&[
+                "process_wrapper",
+                "--touch-file",
+                "done",
+                "--arg-file",
+                "a b",
+                "--cargo-bin-name",
+                "",
+                "--subst",
+                "pwd=${pwd}",
+                "--",
+                "rustc",
+                "--flagfile=child.params",
+            ])
+        );
+    }
+
+    #[test]
+    fn flag_file_read_error_is_reported() {
+        let argv = strings(&["process_wrapper", "--flagfile=missing", "--", "rustc"]);
+        let err = expand_flag_files(argv, |_| Err(OptionError::Generic("boom".to_owned())));
+        assert!(matches!(err, Err(OptionError::Generic(msg)) if msg == "boom"));
+    }
 
     // https://github.com/bazelbuild/rules_rust/issues/4299
     #[test]
